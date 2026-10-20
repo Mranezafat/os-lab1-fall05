@@ -162,6 +162,32 @@ cgaputc(int c)
   crt[pos] = ' ' | 0x0700;
 }
 
+static void
+move_cursor(int forward)
+{
+  int pos;
+
+  outb(CRTPORT, 14);
+  pos = inb(CRTPORT+1) << 8;
+  outb(CRTPORT, 15);
+  pos |= inb(CRTPORT+1);
+
+  if(forward){
+    if(pos >= 25*80-1)
+      return;
+    pos++;
+  } else {
+    if(pos <= 0)
+      return;
+    pos--;
+  }
+
+  outb(CRTPORT, 14);
+  outb(CRTPORT+1, pos >> 8);
+  outb(CRTPORT, 15);
+  outb(CRTPORT+1, pos);
+}
+
 void
 consputc(int c)
 {
@@ -184,9 +210,12 @@ struct {
   uint r;  // Read index
   uint w;  // Write index
   uint e;  // Edit index
+  uint cursor;
 } input;
 
 #define C(x)  ((x)-'@')  // Control-x
+#define KEY_LF 0xE4
+#define KEY_RT 0xE5
 
 void
 consoleintr(int (*getc)(void))
@@ -208,15 +237,48 @@ consoleintr(int (*getc)(void))
       }
       break;
     case C('H'): case '\x7f':  // Backspace
-      if(input.e != input.w){
+      if(input.cursor > input.w){
+        uint i;
+
+        // Remove the character immediately before the cursor.
+        for(i = input.cursor - 1; i < input.e - 1; i++)
+          input.buf[i % INPUT_BUF] =
+            input.buf[(i + 1) % INPUT_BUF];
+
+        input.cursor--;
         input.e--;
-        consputc(BACKSPACE);
+
+        // Move to the deleted character and redraw the remaining tail.
+        move_cursor(0);
+        for(i = input.cursor; i < input.e; i++)
+          cgaputc(input.buf[i % INPUT_BUF]);
+
+        // Clear the old last character.
+        cgaputc(' ');
+
+        // Return the hardware cursor to the logical cursor position.
+        for(i = input.cursor; i <= input.e; i++)
+          move_cursor(0);
+      }
+      break;
+    case KEY_LF:
+      if(input.cursor > input.w){
+        input.cursor--;
+        move_cursor(0);
+      }
+      break;
+
+    case KEY_RT:
+      if(input.cursor < input.e){
+        input.cursor++;
+        move_cursor(1);
       }
       break;
     default:
       if(c != 0 && input.e-input.r < INPUT_BUF){
         c = (c == '\r') ? '\n' : c;
         input.buf[input.e++ % INPUT_BUF] = c;
+        input.cursor = input.e;
         consputc(c);
         if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
           input.w = input.e;
