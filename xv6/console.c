@@ -216,6 +216,39 @@ struct {
 #define C(x)  ((x)-'@')  // Control-x
 #define KEY_LF 0xE4
 #define KEY_RT 0xE5
+#define KEY_DEL 0xE9
+
+enum delete_mode {
+  DELETE_BACKSPACE,
+  DELETE_FORWARD
+};
+
+static void
+delete_char(enum delete_mode mode)
+{
+  uint i;
+  uint delete_index;
+  if(mode == DELETE_BACKSPACE){
+    if(input.cursor <= input.w)
+      return;
+    delete_index = input.cursor - 1;
+    input.cursor--;
+    move_cursor(0);
+  } else {
+    if(input.cursor >= input.e)
+      return;
+    delete_index = input.cursor;
+  }
+  for(i = delete_index; i < input.e - 1; i++)
+    input.buf[i % INPUT_BUF] =
+      input.buf[(i + 1) % INPUT_BUF];
+  input.e--;
+  for(i = input.cursor; i < input.e; i++)
+    cgaputc(input.buf[i % INPUT_BUF]);
+  cgaputc(' ');
+  for(i = input.cursor; i <= input.e; i++)
+    move_cursor(0);
+}
 
 void
 consoleintr(int (*getc)(void))
@@ -237,29 +270,10 @@ consoleintr(int (*getc)(void))
       }
       break;
     case C('H'): case '\x7f':  // Backspace
-      if(input.cursor > input.w){
-        uint i;
-
-        // Remove the character immediately before the cursor.
-        for(i = input.cursor - 1; i < input.e - 1; i++)
-          input.buf[i % INPUT_BUF] =
-            input.buf[(i + 1) % INPUT_BUF];
-
-        input.cursor--;
-        input.e--;
-
-        // Move to the deleted character and redraw the remaining tail.
-        move_cursor(0);
-        for(i = input.cursor; i < input.e; i++)
-          cgaputc(input.buf[i % INPUT_BUF]);
-
-        // Clear the old last character.
-        cgaputc(' ');
-
-        // Return the hardware cursor to the logical cursor position.
-        for(i = input.cursor; i <= input.e; i++)
-          move_cursor(0);
-      }
+      delete_char(DELETE_BACKSPACE);
+      break;
+    case KEY_DEL:
+      delete_char(DELETE_FORWARD);
       break;
     case KEY_LF:
       if(input.cursor > input.w){
