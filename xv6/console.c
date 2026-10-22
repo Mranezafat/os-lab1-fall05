@@ -213,6 +213,8 @@ struct {
   uint cursor;
   uint selection_anchor;
   int selecting;
+  uint line_start;
+  uint rendered_len;
 } input;
 
 static int
@@ -237,12 +239,10 @@ set_cursor_pos(int pos)
 }
 
 static void
-render_input(uint old_cursor)
+render_input(void)
 {
-  int pos;
   uint lo, hi, i;
 
-  pos = get_cursor_pos() - ((int)old_cursor - (int)input.w);
   if(input.cursor < input.selection_anchor){
     lo = input.cursor;
     hi = input.selection_anchor;
@@ -251,13 +251,86 @@ render_input(uint old_cursor)
     hi = input.cursor;
   }
 
+  for(i = 0; i < input.rendered_len; i++)
+    if(input.line_start + i < 25 * 80)
+      crt[input.line_start + i] = ' ' | 0x0700;
+
   for(i = input.w; i < input.e; i++){
     uchar attr = (input.selecting && i >= lo && i < hi) ? 0x70 : 0x07;
-    crt[pos + (i - input.w)] =
-      input.buf[i % INPUT_BUF] | (attr << 8);
+    if(input.line_start + (i - input.w) < 25 * 80)
+      crt[input.line_start + (i - input.w)] =
+        input.buf[i % INPUT_BUF] | (attr << 8);
   }
-  crt[pos + (input.e - input.w)] = ' ' | 0x0700;
-  set_cursor_pos(pos + (input.cursor - input.w));
+  input.rendered_len = input.e - input.w;
+  set_cursor_pos(input.line_start + (input.cursor - input.w));
+}
+
+static char clipboard[INPUT_BUF];
+static uint clipboard_len;
+
+static int
+selection_bounds(uint *lo, uint *hi)
+{
+  if(!input.selecting || input.cursor == input.selection_anchor)
+    return 0;
+  if(input.cursor < input.selection_anchor){
+    *lo = input.cursor;
+    *hi = input.selection_anchor;
+  } else {
+    *lo = input.selection_anchor;
+    *hi = input.cursor;
+  }
+  return 1;
+}
+
+static void
+copy_selection(void)
+{
+  uint lo, hi, i;
+
+  if(!selection_bounds(&lo, &hi))
+    return;
+  clipboard_len = hi - lo;
+  for(i = 0; i < clipboard_len; i++)
+    clipboard[i] = input.buf[(lo + i) % INPUT_BUF];
+}
+
+static void
+delete_selection(void)
+{
+  uint lo, hi, i, len;
+
+  if(!selection_bounds(&lo, &hi))
+    return;
+  len = hi - lo;
+  for(i = lo; i < input.e - len; i++)
+    input.buf[i % INPUT_BUF] = input.buf[(i + len) % INPUT_BUF];
+  input.e -= len;
+  input.cursor = lo;
+  input.selecting = 0;
+  render_input();
+}
+
+static void
+paste_clipboard(void)
+{
+  uint i;
+
+  if(clipboard_len == 0)
+    return;
+  if(input.selecting)
+    delete_selection();
+  if(input.e - input.r + clipboard_len > INPUT_BUF)
+    return;
+
+  for(i = input.e; i > input.cursor; i--)
+    input.buf[(i + clipboard_len - 1) % INPUT_BUF] =
+      input.buf[(i - 1) % INPUT_BUF];
+  for(i = 0; i < clipboard_len; i++)
+    input.buf[(input.cursor + i) % INPUT_BUF] = clipboard[i];
+  input.e += clipboard_len;
+  input.cursor += clipboard_len;
+  render_input();
 }
 
 #define C(x)  ((x)-'@')  // Control-x
@@ -277,6 +350,10 @@ delete_char(enum delete_mode mode)
 {
   uint i;
   uint delete_index;
+  if(input.selecting && input.cursor != input.selection_anchor){
+    delete_selection();
+    return;
+  }
   if(mode == DELETE_BACKSPACE){
     if(input.cursor <= input.w)
       return;
@@ -292,11 +369,7 @@ delete_char(enum delete_mode mode)
     input.buf[i % INPUT_BUF] =
       input.buf[(i + 1) % INPUT_BUF];
   input.e--;
-  for(i = input.cursor; i < input.e; i++)
-    cgaputc(input.buf[i % INPUT_BUF]);
-  cgaputc(' ');
-  for(i = input.cursor; i <= input.e; i++)
-    move_cursor(0);
+  render_input();
 }
 
 void
@@ -310,6 +383,12 @@ consoleintr(int (*getc)(void))
     case C('P'):  // Process listing.
       // procdump() locks cons.lock indirectly; invoke later
       doprocdump = 1;
+      break;
+    case C('C'):
+      copy_selection();
+      break;
+    case C('V'):
+      paste_clipboard();
       break;
     case C('U'):  // Kill line.
       while(input.e != input.w &&
@@ -329,7 +408,7 @@ consoleintr(int (*getc)(void))
         input.selecting = 0;
         input.cursor--;
         move_cursor(0);
-        render_input(input.cursor);
+        render_input();
       }
       break;
 
@@ -338,12 +417,11 @@ consoleintr(int (*getc)(void))
         input.selecting = 0;
         input.cursor++;
         move_cursor(1);
-        render_input(input.cursor);
+        render_input();
       }
       break;
 
     case KEY_SHIFT_LF: {
-      uint old_cursor = input.cursor;
       if(!input.selecting){
         input.selection_anchor = input.cursor;
         input.selecting = 1;
@@ -352,12 +430,11 @@ consoleintr(int (*getc)(void))
         input.cursor--;
       if(input.cursor == input.selection_anchor)
         input.selecting = 0;
-      render_input(old_cursor);
+      render_input();
       break;
     }
 
     case KEY_SHIFT_RT: {
-      uint old_cursor = input.cursor;
       if(!input.selecting){
         input.selection_anchor = input.cursor;
         input.selecting = 1;
@@ -366,13 +443,19 @@ consoleintr(int (*getc)(void))
         input.cursor++;
       if(input.cursor == input.selection_anchor)
         input.selecting = 0;
-      render_input(old_cursor);
+      render_input();
       break;
     }
     default:
       if(c != 0 && input.e-input.r < INPUT_BUF){
         uint i;
 
+        if(input.selecting && input.cursor != input.selection_anchor)
+          delete_selection();
+        if(input.e == input.w && input.cursor == input.e){
+          input.line_start = get_cursor_pos();
+          input.rendered_len = 0;
+        }
         c = (c == '\r') ? '\n' : c;
 
         if(c == '\n' || c == C('D')){
@@ -388,16 +471,12 @@ consoleintr(int (*getc)(void))
           input.e++;
           input.cursor++;
 
-          consputc(c);
-          for(i = input.cursor; i < input.e; i++)
-            cgaputc(input.buf[i % INPUT_BUF]);
-
-          for(i = input.cursor; i < input.e; i++)
-            move_cursor(0);
+          render_input();
         }
 
         if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
           input.w = input.e;
+          input.rendered_len = 0;
           wakeup(&input.r);
         }
       }
