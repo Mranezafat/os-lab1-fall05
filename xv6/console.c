@@ -211,12 +211,61 @@ struct {
   uint w;  // Write index
   uint e;  // Edit index
   uint cursor;
+  uint selection_anchor;
+  int selecting;
 } input;
+
+static int
+get_cursor_pos(void)
+{
+  int pos;
+
+  outb(CRTPORT, 14);
+  pos = inb(CRTPORT+1) << 8;
+  outb(CRTPORT, 15);
+  pos |= inb(CRTPORT+1);
+  return pos;
+}
+
+static void
+set_cursor_pos(int pos)
+{
+  outb(CRTPORT, 14);
+  outb(CRTPORT+1, pos >> 8);
+  outb(CRTPORT, 15);
+  outb(CRTPORT+1, pos);
+}
+
+static void
+render_input(uint old_cursor)
+{
+  int pos;
+  uint lo, hi, i;
+
+  pos = get_cursor_pos() - ((int)old_cursor - (int)input.w);
+  if(input.cursor < input.selection_anchor){
+    lo = input.cursor;
+    hi = input.selection_anchor;
+  } else {
+    lo = input.selection_anchor;
+    hi = input.cursor;
+  }
+
+  for(i = input.w; i < input.e; i++){
+    uchar attr = (input.selecting && i >= lo && i < hi) ? 0x70 : 0x07;
+    crt[pos + (i - input.w)] =
+      input.buf[i % INPUT_BUF] | (attr << 8);
+  }
+  crt[pos + (input.e - input.w)] = ' ' | 0x0700;
+  set_cursor_pos(pos + (input.cursor - input.w));
+}
 
 #define C(x)  ((x)-'@')  // Control-x
 #define KEY_LF 0xE4
 #define KEY_RT 0xE5
 #define KEY_DEL 0xE9
+#define KEY_SHIFT_LF 0xEA
+#define KEY_SHIFT_RT 0xEB
 
 enum delete_mode {
   DELETE_BACKSPACE,
@@ -277,17 +326,49 @@ consoleintr(int (*getc)(void))
       break;
     case KEY_LF:
       if(input.cursor > input.w){
+        input.selecting = 0;
         input.cursor--;
         move_cursor(0);
+        render_input(input.cursor);
       }
       break;
 
     case KEY_RT:
       if(input.cursor < input.e){
+        input.selecting = 0;
         input.cursor++;
         move_cursor(1);
+        render_input(input.cursor);
       }
       break;
+
+    case KEY_SHIFT_LF: {
+      uint old_cursor = input.cursor;
+      if(!input.selecting){
+        input.selection_anchor = input.cursor;
+        input.selecting = 1;
+      }
+      if(input.cursor > input.w)
+        input.cursor--;
+      if(input.cursor == input.selection_anchor)
+        input.selecting = 0;
+      render_input(old_cursor);
+      break;
+    }
+
+    case KEY_SHIFT_RT: {
+      uint old_cursor = input.cursor;
+      if(!input.selecting){
+        input.selection_anchor = input.cursor;
+        input.selecting = 1;
+      }
+      if(input.cursor < input.e)
+        input.cursor++;
+      if(input.cursor == input.selection_anchor)
+        input.selecting = 0;
+      render_input(old_cursor);
+      break;
+    }
     default:
       if(c != 0 && input.e-input.r < INPUT_BUF){
         uint i;
