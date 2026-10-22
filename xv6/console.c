@@ -276,10 +276,31 @@ consoleintr(int (*getc)(void))
       break;
     default:
       if(c != 0 && input.e-input.r < INPUT_BUF){
+        uint i;
+
         c = (c == '\r') ? '\n' : c;
-        input.buf[input.e++ % INPUT_BUF] = c;
-        input.cursor = input.e;
-        consputc(c);
+
+        if(c == '\n' || c == C('D')){
+          input.buf[input.e++ % INPUT_BUF] = c;
+          input.cursor = input.e;
+          consputc(c);
+        } else {
+          for(i = input.e; i > input.cursor; i--)
+            input.buf[i % INPUT_BUF] =
+              input.buf[(i - 1) % INPUT_BUF];
+
+          input.buf[input.cursor % INPUT_BUF] = c;
+          input.e++;
+          input.cursor++;
+
+          consputc(c);
+          for(i = input.cursor; i < input.e; i++)
+            cgaputc(input.buf[i % INPUT_BUF]);
+
+          for(i = input.cursor; i < input.e; i++)
+            move_cursor(0);
+        }
+
         if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
           input.w = input.e;
           wakeup(&input.r);
