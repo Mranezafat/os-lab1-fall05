@@ -27,8 +27,6 @@
 #define KEY_PGDN        0xE7
 #define KEY_INS         0xE8
 #define KEY_DEL         0xE9
-#define KEY_SHIFT_LF   0xEA
-#define KEY_SHIFT_RT   0xEB
 
 // C('A') == Control-A
 #define C(x) (x - '@')

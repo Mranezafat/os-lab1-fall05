@@ -162,32 +162,6 @@ cgaputc(int c)
   crt[pos] = ' ' | 0x0700;
 }
 
-static void
-move_cursor(int forward)
-{
-  int pos;
-
-  outb(CRTPORT, 14);
-  pos = inb(CRTPORT+1) << 8;
-  outb(CRTPORT, 15);
-  pos |= inb(CRTPORT+1);
-
-  if(forward){
-    if(pos >= 25*80-1)
-      return;
-    pos++;
-  } else {
-    if(pos <= 0)
-      return;
-    pos--;
-  }
-
-  outb(CRTPORT, 14);
-  outb(CRTPORT+1, pos >> 8);
-  outb(CRTPORT, 15);
-  outb(CRTPORT+1, pos);
-}
-
 void
 consputc(int c)
 {
@@ -205,16 +179,21 @@ consputc(int c)
 }
 
 #define INPUT_BUF 128
+#define SELECT_NONE 0
+#define SELECT_MARKING 1
+#define SELECT_DONE 2
+
 struct {
   char buf[INPUT_BUF];
   uint r;  // Read index
   uint w;  // Write index
   uint e;  // Edit index
   uint cursor;
-  uint selection_anchor;
-  int selecting;
-  uint line_start;
+  uint display_cursor;
   uint rendered_len;
+  uint line_start;
+  uint selection_anchor;
+  int selection_state;
 } input;
 
 static int
@@ -241,28 +220,65 @@ set_cursor_pos(int pos)
 static void
 render_input(void)
 {
-  uint lo, hi, i;
+  uint attr, cursor_offset, hi, i, len, lo, total;
 
-  if(input.cursor < input.selection_anchor){
-    lo = input.cursor;
-    hi = input.selection_anchor;
-  } else {
-    lo = input.selection_anchor;
-    hi = input.cursor;
+  len = input.e - input.w;
+  cursor_offset = input.cursor - input.w;
+
+  if(len == 0 && input.rendered_len == 0)
+    input.line_start = get_cursor_pos();
+
+  for(i = 0; i < input.display_cursor; i++)
+    uartputc('\b');
+
+  for(i = input.w; i < input.e; i++)
+    uartputc(input.buf[i % INPUT_BUF]);
+
+  total = len;
+  if(input.rendered_len > len){
+    total = input.rendered_len;
+    for(i = len; i < input.rendered_len; i++)
+      uartputc(' ');
+  }
+
+  for(i = cursor_offset; i < total; i++)
+    uartputc('\b');
+
+  while(input.line_start + total >= 24*80){
+    memmove(crt, crt+80, sizeof(crt[0])*23*80);
+    memset(crt+23*80, 0, sizeof(crt[0])*80);
+    if(input.line_start >= 80)
+      input.line_start -= 80;
+    else
+      input.line_start = 0;
   }
 
   for(i = 0; i < input.rendered_len; i++)
-    if(input.line_start + i < 25 * 80)
-      crt[input.line_start + i] = ' ' | 0x0700;
+    crt[input.line_start + i] = ' ' | 0x0700;
+
+  lo = hi = 0;
+  if(input.selection_state == SELECT_DONE){
+    if(input.cursor < input.selection_anchor){
+      lo = input.cursor;
+      hi = input.selection_anchor;
+    } else {
+      lo = input.selection_anchor;
+      hi = input.cursor;
+    }
+  }
 
   for(i = input.w; i < input.e; i++){
-    uchar attr = (input.selecting && i >= lo && i < hi) ? 0x70 : 0x07;
-    if(input.line_start + (i - input.w) < 25 * 80)
-      crt[input.line_start + (i - input.w)] =
-        input.buf[i % INPUT_BUF] | (attr << 8);
+    attr = 0x0700;
+    if(input.selection_state == SELECT_DONE && i >= lo && i < hi)
+      attr = 0x7000;
+    crt[input.line_start + i - input.w] =
+      (input.buf[i % INPUT_BUF] & 0xff) | attr;
   }
-  input.rendered_len = input.e - input.w;
-  set_cursor_pos(input.line_start + (input.cursor - input.w));
+
+  set_cursor_pos(input.line_start + cursor_offset);
+
+  input.display_cursor = cursor_offset;
+  input.rendered_len = len;
 }
 
 static char clipboard[INPUT_BUF];
@@ -271,7 +287,8 @@ static uint clipboard_len;
 static int
 selection_bounds(uint *lo, uint *hi)
 {
-  if(!input.selecting || input.cursor == input.selection_anchor)
+  if(input.selection_state != SELECT_DONE ||
+     input.cursor == input.selection_anchor)
     return 0;
   if(input.cursor < input.selection_anchor){
     *lo = input.cursor;
@@ -295,41 +312,56 @@ copy_selection(void)
     clipboard[i] = input.buf[(lo + i) % INPUT_BUF];
 }
 
-static void
+static int
 delete_selection(void)
 {
   uint lo, hi, i, len;
 
   if(!selection_bounds(&lo, &hi))
-    return;
+    return 0;
   len = hi - lo;
   for(i = lo; i < input.e - len; i++)
     input.buf[i % INPUT_BUF] = input.buf[(i + len) % INPUT_BUF];
   input.e -= len;
   input.cursor = lo;
-  input.selecting = 0;
-  render_input();
+  input.selection_state = SELECT_NONE;
+  return 1;
+}
+
+static void
+insert_characters(char *text, uint len)
+{
+  uint i;
+
+  for(i = input.e; i > input.cursor; i--)
+    input.buf[(i + len - 1) % INPUT_BUF] =
+      input.buf[(i - 1) % INPUT_BUF];
+
+  for(i = 0; i < len; i++)
+    input.buf[(input.cursor + i) % INPUT_BUF] = text[i];
+
+  input.e += len;
+  input.cursor += len;
 }
 
 static void
 paste_clipboard(void)
 {
-  uint i;
+  uint hi, lo, selected_len;
 
   if(clipboard_len == 0)
     return;
-  if(input.selecting)
-    delete_selection();
-  if(input.e - input.r + clipboard_len > INPUT_BUF)
+
+  selected_len = 0;
+  if(selection_bounds(&lo, &hi))
+    selected_len = hi - lo;
+
+  if(input.e - input.r - selected_len + clipboard_len > INPUT_BUF)
     return;
 
-  for(i = input.e; i > input.cursor; i--)
-    input.buf[(i + clipboard_len - 1) % INPUT_BUF] =
-      input.buf[(i - 1) % INPUT_BUF];
-  for(i = 0; i < clipboard_len; i++)
-    input.buf[(input.cursor + i) % INPUT_BUF] = clipboard[i];
-  input.e += clipboard_len;
-  input.cursor += clipboard_len;
+  delete_selection();
+  input.selection_state = SELECT_NONE;
+  insert_characters(clipboard, clipboard_len);
   render_input();
 }
 
@@ -337,8 +369,6 @@ paste_clipboard(void)
 #define KEY_LF 0xE4
 #define KEY_RT 0xE5
 #define KEY_DEL 0xE9
-#define KEY_SHIFT_LF 0xEA
-#define KEY_SHIFT_RT 0xEB
 
 enum delete_mode {
   DELETE_BACKSPACE,
@@ -350,16 +380,21 @@ delete_char(enum delete_mode mode)
 {
   uint i;
   uint delete_index;
-  if(input.selecting && input.cursor != input.selection_anchor){
-    delete_selection();
+
+  if(input.selection_state == SELECT_MARKING)
+    return;
+
+  if(delete_selection()){
+    render_input();
     return;
   }
+
+  input.selection_state = SELECT_NONE;
   if(mode == DELETE_BACKSPACE){
     if(input.cursor <= input.w)
       return;
     delete_index = input.cursor - 1;
     input.cursor--;
-    move_cursor(0);
   } else {
     if(input.cursor >= input.e)
       return;
@@ -370,6 +405,72 @@ delete_char(enum delete_mode mode)
       input.buf[(i + 1) % INPUT_BUF];
   input.e--;
   render_input();
+}
+
+static void
+move_input_cursor(int direction)
+{
+  if(input.selection_state == SELECT_DONE)
+    input.selection_state = SELECT_NONE;
+
+  if(direction < 0){
+    if(input.cursor > input.w)
+      input.cursor--;
+  } else {
+    if(input.cursor < input.e)
+      input.cursor++;
+  }
+  render_input();
+}
+
+static void
+move_to_line_end(int to_end)
+{
+  if(input.selection_state == SELECT_DONE)
+    input.selection_state = SELECT_NONE;
+
+  if(to_end)
+    input.cursor = input.e;
+  else
+    input.cursor = input.w;
+  render_input();
+}
+
+static void
+toggle_selection(void)
+{
+  if(input.selection_state == SELECT_MARKING){
+    if(input.cursor == input.selection_anchor)
+      input.selection_state = SELECT_NONE;
+    else
+      input.selection_state = SELECT_DONE;
+  } else {
+    input.selection_anchor = input.cursor;
+    input.selection_state = SELECT_MARKING;
+  }
+  render_input();
+}
+
+static void
+finish_input(int c)
+{
+  if(input.selection_state == SELECT_DONE)
+    delete_selection();
+  input.selection_state = SELECT_NONE;
+
+  input.cursor = input.e;
+  render_input();
+
+  if(input.e - input.r >= INPUT_BUF)
+    return;
+
+  input.buf[input.e++ % INPUT_BUF] = c;
+  input.cursor = input.e;
+  consputc(c);
+  input.w = input.e;
+  input.display_cursor = 0;
+  input.rendered_len = 0;
+  wakeup(&input.r);
 }
 
 void
@@ -388,14 +489,23 @@ consoleintr(int (*getc)(void))
       copy_selection();
       break;
     case C('V'):
-      paste_clipboard();
+      if(input.selection_state != SELECT_MARKING)
+        paste_clipboard();
+      break;
+    case C('I'):
+      toggle_selection();
+      break;
+    case C('Q'):
+      move_to_line_end(0);
+      break;
+    case C('E'):
+      move_to_line_end(1);
       break;
     case C('U'):  // Kill line.
-      while(input.e != input.w &&
-            input.buf[(input.e-1) % INPUT_BUF] != '\n'){
-        input.e--;
-        consputc(BACKSPACE);
-      }
+      input.e = input.w;
+      input.cursor = input.w;
+      input.selection_state = SELECT_NONE;
+      render_input();
       break;
     case C('H'): case '\x7f':  // Backspace
       delete_char(DELETE_BACKSPACE);
@@ -404,78 +514,43 @@ consoleintr(int (*getc)(void))
       delete_char(DELETE_FORWARD);
       break;
     case KEY_LF:
-      if(input.cursor > input.w){
-        input.selecting = 0;
-        input.cursor--;
-        move_cursor(0);
-        render_input();
-      }
+      move_input_cursor(-1);
       break;
-
     case KEY_RT:
-      if(input.cursor < input.e){
-        input.selecting = 0;
-        input.cursor++;
-        move_cursor(1);
-        render_input();
-      }
+      move_input_cursor(1);
       break;
-
-    case KEY_SHIFT_LF: {
-      if(!input.selecting){
-        input.selection_anchor = input.cursor;
-        input.selecting = 1;
-      }
-      if(input.cursor > input.w)
-        input.cursor--;
-      if(input.cursor == input.selection_anchor)
-        input.selecting = 0;
-      render_input();
-      break;
-    }
-
-    case KEY_SHIFT_RT: {
-      if(!input.selecting){
-        input.selection_anchor = input.cursor;
-        input.selecting = 1;
-      }
-      if(input.cursor < input.e)
-        input.cursor++;
-      if(input.cursor == input.selection_anchor)
-        input.selecting = 0;
-      render_input();
-      break;
-    }
     default:
-      if(c != 0 && input.e-input.r < INPUT_BUF){
-        uint i;
+      if(c == 0)
+        break;
 
-        if(input.selecting && input.cursor != input.selection_anchor)
-          delete_selection();
-        if(input.e == input.w && input.cursor == input.e){
-          input.line_start = get_cursor_pos();
-          input.rendered_len = 0;
-        }
-        c = (c == '\r') ? '\n' : c;
+      c = (c == '\r') ? '\n' : c;
+      if(c == '\n' || c == C('D')){
+        finish_input(c);
+        break;
+      }
 
-        if(c == '\n' || c == C('D')){
-          input.buf[input.e++ % INPUT_BUF] = c;
-          input.cursor = input.e;
-          consputc(c);
-        } else {
-          for(i = input.e; i > input.cursor; i--)
-            input.buf[i % INPUT_BUF] =
-              input.buf[(i - 1) % INPUT_BUF];
+      if(input.selection_state == SELECT_MARKING)
+        break;
 
-          input.buf[input.cursor % INPUT_BUF] = c;
-          input.e++;
-          input.cursor++;
+      {
+        uint hi, lo, selected_len;
+        char character;
 
-          render_input();
-        }
+        selected_len = 0;
+        if(selection_bounds(&lo, &hi))
+          selected_len = hi - lo;
+        if(input.e - input.r - selected_len >= INPUT_BUF)
+          break;
 
-        if(c == '\n' || c == C('D') || input.e == input.r+INPUT_BUF){
+        delete_selection();
+        input.selection_state = SELECT_NONE;
+        character = c;
+        insert_characters(&character, 1);
+        render_input();
+
+        if(input.e == input.r + INPUT_BUF){
           input.w = input.e;
+          input.display_cursor = 0;
           input.rendered_len = 0;
           wakeup(&input.r);
         }

@@ -195,10 +195,6 @@ add_history(const char *cmd)
 {
   if(cmd == 0 || cmd[0] == 0)
     return;
-  // Exclude 'history' command itself so checking history does not pollute it
-  if(strcmp(cmd, "history") == 0)
-    return;
-
   if(history_count < MAX_HIST){
     history_table[history_count].id = next_history_id++;
     my_strncpy(history_table[history_count].cmd, cmd, MAX_CMD_LEN - 1);

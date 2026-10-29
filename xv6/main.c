@@ -26,7 +26,7 @@ main(void)
   ioapicinit();    // another interrupt controller
   consoleinit();   // console hardware
   uartinit();      // serial port
-  cprintf("OS Lab 1 group: Mranezafat, parhambt, Kaan Esen\n");
+  cprintf("OS Lab 1 group: Mranezafat, parhambt, SamiMassB\n");
   pinit();         // process table
   tvinit();        // trap vectors
   binit();         // buffer cache
